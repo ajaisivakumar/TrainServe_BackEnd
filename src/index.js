@@ -49,8 +49,10 @@ app.use('/api/users',         userRoutes);
 app.use('/api/orders',        orderRoutes);
 app.use('/api/notifications', notifRoutes);
 app.use('/api/reports', reportRoutes);
+
 // ── 404 fallback ───────────────────────────────────
-──────────────────
+
+
 app.use((req, res) => {
   res.status(404).json({ error: `Cannot ${req.method} ${req.path}` });
 });
