@@ -27,6 +27,9 @@ async function fetchOrders(whereClause = '', params = []) {
        o.train_name        AS "trainName",
        o.current_location  AS "currentLocation",
        o.eta,
+       o.order_type        AS "orderType",
+       o.stall_name        AS "stallName",
+       o.stall_location    AS "stallLocation",
        o.status,
        o.assigned_crew_id  AS "assignedCrewId",
        o.total,
@@ -61,12 +64,29 @@ async function fetchOrders(whereClause = '', params = []) {
 // ── POST /orders ─────────────────────────────────────────────────────
 // Place a new order (user, pantry, or admin)
 router.post('/', requireAuth, async (req, res) => {
-  const { userName, trainNo, trainName, currentLocation, eta, items } = req.body;
+  const {
+    orderType = 'train',
+    userName, trainNo, trainName, currentLocation, eta,
+    stallName, stallLocation,
+    items
+  } = req.body;
 
-  if (!userName || !trainNo || !trainName || !currentLocation || !eta || !items?.length) {
-    return res.status(400).json({ error: 'All order fields are required' });
+  if (orderType === 'train') {
+    if (!userName || !trainNo || !trainName || !currentLocation || !eta || !items?.length) {
+      return res.status(400).json({ error: 'All train order fields are required' });
+    }
+  } else if (orderType === 'stall') {
+    if (!userName || !stallName || !items?.length) {
+      return res.status(400).json({ error: 'Stall owner name, stall name, and items are required' });
+    }
+  } else {
+    return res.status(400).json({ error: 'Invalid orderType' });
   }
 
+
+
+
+  
   const total = items.reduce((s, i) => s + i.price * i.qty, 0);
   const orderId = await generateOrderId();
   const client  = await pool.connect();
@@ -76,9 +96,21 @@ router.post('/', requireAuth, async (req, res) => {
 
     await client.query(
       `INSERT INTO orders
-         (id, user_id, user_name, train_no, train_name, current_location, eta, total)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [orderId, req.user.id || null, userName, trainNo, trainName, currentLocation, eta, total]
+         (id, user_id, user_name, train_no, train_name, current_location, eta, total, order_type, stall_name, stall_location)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [
+        orderId,
+        req.user.id || null,
+        userName,
+        orderType === 'train' ? trainNo : '',
+        orderType === 'train' ? trainName : stallName,
+        orderType === 'train' ? currentLocation : (stallLocation || stallName),
+        orderType === 'train' ? eta : 'N/A',
+        total,
+        orderType,
+        orderType === 'stall' ? stallName : null,
+        orderType === 'stall' ? (stallLocation || null) : null,
+      ]
     );
 
     for (const item of items) {
@@ -390,6 +422,8 @@ router.get('/admin/delivery-logs', ...requireRole('ADMIN'), async (req, res) => 
          o.train_no                                                    AS "trainNo",
          o.train_name                                                  AS "trainName",
          o.eta                                                         AS "etaGiven",
+         o.order_type                                                  AS "orderType",
+         o.stall_name                                                  AS "stallName",
          o.created_at                                                  AS "placedAt",
          o.accepted_at                                                 AS "acceptedAt",
          o.completed_at                                                AS "deliveredAt",
