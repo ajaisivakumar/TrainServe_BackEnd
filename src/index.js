@@ -11,6 +11,7 @@ const authRoutes    = require('./routes/auth');
 const userRoutes    = require('./routes/users');
 const orderRoutes   = require('./routes/orders');
 const notifRoutes   = require('./routes/notifications');
+const reportRoutes   = require('./routes/reports');
 
 const app  = express();
 const PORT = process.env.PORT || 8080;
@@ -47,8 +48,9 @@ app.use('/api/auth',          authRoutes);
 app.use('/api/users',         userRoutes);
 app.use('/api/orders',        orderRoutes);
 app.use('/api/notifications', notifRoutes);
-
-// ── 404 fallback ─────────────────────────────────────────────────────
+app.use('/api/reports', reportRoutes);
+// ── 404 fallback ───────────────────────────────────
+──────────────────
 app.use((req, res) => {
   res.status(404).json({ error: `Cannot ${req.method} ${req.path}` });
 });
