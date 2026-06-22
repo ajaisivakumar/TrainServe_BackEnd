@@ -1,8 +1,51 @@
 // src/routes/reports.js
-const router   = require('express').Router();
-const pool     = require('../db/pool');
-const ExcelJS  = require('exceljs');
+const router  = require('express').Router();
+const pool    = require('../db/pool');
+const ExcelJS = require('exceljs');
 const { requireRole } = require('../middleware/auth');
+
+const HEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF111827' } };
+const HEADER_FONT = { name: 'Calibri', bold: true, size: 11, color: { argb: 'FFFFFFFF' } };
+const BODY_FONT   = { name: 'Calibri', size: 10.5 };
+const BORDER_THIN = { style: 'thin', color: { argb: 'FFD9D9D9' } };
+const CELL_BORDER = { top: BORDER_THIN, left: BORDER_THIN, bottom: BORDER_THIN, right: BORDER_THIN };
+const CURRENCY_FMT = '₹#,##0.00;[RED]-₹#,##0.00;"-"';
+const DATETIME_FMT = 'dd-mmm-yyyy hh:mm AM/PM';
+
+const ROW_FILLS = {
+  ASSIGNED:   'FFFFF3CD',
+  UNASSIGNED: 'FFFDE2E1',
+};
+
+// ── Helpers ──────────────────────────────────────────────────────────
+function styleHeaderRow(row) {
+  row.eachCell(cell => {
+    cell.font = HEADER_FONT;
+    cell.fill = HEADER_FILL;
+    cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+    cell.border = CELL_BORDER;
+  });
+  row.height = 26;
+}
+
+function styleBodyRow(row, fillArgb) {
+  row.eachCell(cell => {
+    cell.font = BODY_FONT;
+    cell.alignment = { vertical: 'middle', wrapText: true };
+    cell.border = CELL_BORDER;
+    if (fillArgb) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: fillArgb } };
+  });
+}
+
+function setupSheet(wb, name, columns) {
+  const ws = wb.addWorksheet(name, {
+    views: [{ state: 'frozen', ySplit: 1, showGridLines: false }],
+  });
+  ws.columns = columns;
+  styleHeaderRow(ws.getRow(1));
+  ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: columns.length } };
+  return ws;
+}
 
 router.get('/daily', ...requireRole('ADMIN'), async (req, res) => {
   try {
@@ -10,39 +53,17 @@ router.get('/daily', ...requireRole('ADMIN'), async (req, res) => {
     const dateStart = `${date} 00:00:00+05:30`;
     const dateEnd   = `${date} 23:59:59+05:30`;
 
-    // ── Pull all data in parallel ────────────────────────────────────
     const [
-      ordersRes,
-      itemsRes,
-      auditRes,
-      paymentsRes,
-      signupsRes,
-      notifsRes,
+      ordersRes, itemsRes, auditRes, paymentsRes, signupsRes, notifsRes,
     ] = await Promise.all([
-
-      // Full orders with crew name
       pool.query(`
         SELECT
-          o.id,
-          o.created_at,
-          o.order_type,
-          o.user_name,
-          o.train_no,
-          o.train_name,
-          o.stall_name,
-          o.stall_location,
-          o.current_location,
-          o.eta,
-          o.status,
-          o.total,
-          o.assigned_crew_id,
-          o.payment_uploaded,
-          o.accepted_at,
-          o.completed_at,
+          o.id, o.created_at, o.order_type, o.user_name, o.train_no, o.train_name,
+          o.stall_name, o.stall_location, o.current_location, o.eta, o.status, o.total,
+          o.assigned_crew_id, o.payment_uploaded, o.accepted_at, o.completed_at,
           EXTRACT(EPOCH FROM (o.accepted_at - o.created_at))   AS accept_secs,
           EXTRACT(EPOCH FROM (o.completed_at - o.accepted_at)) AS deliver_secs,
-          c.name AS crew_name,
-          u.email AS user_email
+          c.name AS crew_name, u.email AS user_email
         FROM orders o
         LEFT JOIN crew c ON c.crew_id = o.assigned_crew_id
         LEFT JOIN users u ON u.id = o.user_id
@@ -50,15 +71,14 @@ router.get('/daily', ...requireRole('ADMIN'), async (req, res) => {
         ORDER BY o.created_at
       `, [dateStart, dateEnd]),
 
-      // All order items for those orders (we join in JS)
       pool.query(`
         SELECT oi.order_id, oi.name, oi.qty, oi.price, oi.product_id
         FROM order_items oi
         INNER JOIN orders o ON o.id = oi.order_id
         WHERE o.created_at BETWEEN $1 AND $2
+        ORDER BY oi.order_id
       `, [dateStart, dateEnd]),
 
-      // Audit log
       pool.query(`
         SELECT event_time, order_id, event, performed_by, note
         FROM audit_logs
@@ -66,22 +86,14 @@ router.get('/daily', ...requireRole('ADMIN'), async (req, res) => {
         ORDER BY event_time
       `, [dateStart, dateEnd]),
 
-      // Payment screenshots
       pool.query(`
-        SELECT
-          p.order_id,
-          p.amount_paid,
-          p.uploaded_by,
-          p.uploaded_at,
-          p.file_name,
-          p.screenshot_base64
+        SELECT p.order_id, p.amount_paid, p.uploaded_by, p.uploaded_at, p.file_name, p.screenshot_base64
         FROM payment_screenshots p
         INNER JOIN orders o ON o.id = p.order_id
         WHERE p.uploaded_at BETWEEN $1 AND $2
         ORDER BY p.uploaded_at
       `, [dateStart, dateEnd]),
 
-      // New signups
       pool.query(`
         SELECT first_name, last_name, email, role, created_at
         FROM users
@@ -89,11 +101,8 @@ router.get('/daily', ...requireRole('ADMIN'), async (req, res) => {
         ORDER BY created_at
       `, [dateStart, dateEnd]),
 
-      // Notifications sent
       pool.query(`
-        SELECT n.message, n.time, n.read,
-               u.email AS user_email,
-               n.crew_id
+        SELECT n.message, n.time, n.read, u.email AS user_email, n.crew_id
         FROM notifications n
         LEFT JOIN users u ON u.id = n.user_id
         WHERE n.time BETWEEN $1 AND $2
@@ -101,233 +110,308 @@ router.get('/daily', ...requireRole('ADMIN'), async (req, res) => {
       `, [dateStart, dateEnd]),
     ]);
 
-    // Build a lookup: orderId → items array
+    const orders   = ordersRes.rows;
+    const items    = itemsRes.rows;
+    const audits    = auditRes.rows;
+    const payments = paymentsRes.rows;
+    const signups   = signupsRes.rows;
+    const notifs    = notifsRes.rows;
+
     const itemsByOrder = {};
-    for (const item of itemsRes.rows) {
-      if (!itemsByOrder[item.order_id]) itemsByOrder[item.order_id] = [];
-      itemsByOrder[item.order_id].push(item);
-    }
+    for (const it of items) (itemsByOrder[it.order_id] ??= []).push(it);
 
-    // Build a lookup: orderId → payment row
     const paymentByOrder = {};
-    for (const p of paymentsRes.rows) {
-      paymentByOrder[p.order_id] = p;
-    }
+    for (const p of payments) paymentByOrder[p.order_id] = p;
 
-    // Build a lookup: orderId → audit events (comma joined)
     const auditByOrder = {};
-    for (const a of auditRes.rows) {
-      if (!auditByOrder[a.order_id]) auditByOrder[a.order_id] = [];
-      auditByOrder[a.order_id].push(`${a.event} by ${a.performed_by}`);
-    }
+    for (const a of audits) (auditByOrder[a.order_id] ??= []).push(`${a.event} by ${a.performed_by}`);
 
-    // ── Workbook setup ───────────────────────────────────────────────
     const wb = new ExcelJS.Workbook();
     wb.creator = 'TrainServe';
     wb.created = new Date();
 
-    const ws = wb.addWorksheet(`Report ${date}`, {
-      views: [{ state: 'frozen', ySplit: 1 }],
-    });
+    // ══════════════════════════════════════════════════════════════
+    // SHEET 1 — SUMMARY
+    // ══════════════════════════════════════════════════════════════
+    const sum = wb.addWorksheet('Summary', { views: [{ showGridLines: false }] });
+    sum.columns = [{ width: 32 }, { width: 22 }];
 
-    // ── 25 columns ───────────────────────────────────────────────────
-    ws.columns = [
-      { header: 'Row Type',              key: 'rowType',          width: 18 },
-      { header: 'Timestamp',             key: 'timestamp',        width: 22 },
-      { header: 'Order ID',              key: 'orderId',          width: 20 },
-      { header: 'Order Type',            key: 'orderType',        width: 12 },
-      { header: 'Customer / Person',     key: 'customerName',     width: 22 },
-      { header: 'Customer Email',        key: 'customerEmail',    width: 28 },
-      { header: 'Train No',              key: 'trainNo',          width: 12 },
-      { header: 'Train Name',            key: 'trainName',        width: 22 },
-      { header: 'Stall Name',            key: 'stallName',        width: 22 },
-      { header: 'Stall Location',        key: 'stallLocation',    width: 22 },
-      { header: 'Station / Location',    key: 'location',         width: 22 },
-      { header: 'ETA',                   key: 'eta',              width: 12 },
-      { header: 'Items Ordered',         key: 'itemsOrdered',     width: 40 },
-      { header: 'Item Quantities',       key: 'itemQtys',         width: 30 },
-      { header: 'Item Subtotals (₹)',    key: 'itemSubtotals',    width: 30 },
-      { header: 'Order Total (₹)',       key: 'orderTotal',       width: 16 },
-      { header: 'Order Status',          key: 'orderStatus',      width: 14 },
-      { header: 'Assigned Crew',         key: 'assignedCrew',     width: 18 },
-      { header: 'All Events / Actions',  key: 'events',           width: 40 },
-      { header: 'Payment Uploaded',      key: 'paymentUploaded',  width: 18 },
-      { header: 'Amount Paid (₹)',       key: 'amountPaid',       width: 16 },
-      { header: 'Payment File',          key: 'paymentFile',      width: 22 },
-      { header: 'Accepted At',           key: 'acceptedAt',       width: 22 },
-      { header: 'Completed At',          key: 'completedAt',      width: 22 },
-      { header: 'Accept Time (mins)',    key: 'acceptMins',       width: 18 },
-      { header: 'Delivery Time (mins)',  key: 'deliveryMins',     width: 20 },
-      { header: 'Notes / Extra',         key: 'notes',            width: 35 },
+    sum.mergeCells('A1:B1');
+    sum.getCell('A1').value = `TrainServe Daily Report — ${date}`;
+    sum.getCell('A1').font = { name: 'Calibri', bold: true, size: 16, color: { argb: 'FF111827' } };
+    sum.getCell('A1').alignment = { horizontal: 'left' };
+    sum.getRow(1).height = 30;
+
+    const totalRevenue   = orders.reduce((s, o) => s + Number(o.total || 0), 0);
+    const completedCount = orders.filter(o => o.status === 'completed').length;
+    const pendingCount   = orders.filter(o => o.status === 'pending').length;
+    const inProgressCount = orders.filter(o => o.status === 'in_progress' || o.status === 'accepted').length;
+    const avgAcceptMins  = avg(orders.map(o => o.accept_secs).filter(v => v != null)) / 60;
+    const avgDeliverMins = avg(orders.map(o => o.deliver_secs).filter(v => v != null)) / 60;
+
+    const summaryRows = [
+      ['Total Orders', orders.length],
+      ['Completed Orders', completedCount],
+      ['Pending Orders', pendingCount],
+      ['In Progress Orders', inProgressCount],
+      ['Total Revenue (₹)', totalRevenue],
+      ['Avg. Accept Time (mins)', round1(avgAcceptMins)],
+      ['Avg. Delivery Time (mins)', round1(avgDeliverMins)],
+      ['New Signups', signups.length],
+      ['Payment Screenshots Uploaded', payments.length],
+      ['Audit Events Logged', audits.length],
+      ['Notifications Sent', notifs.length],
     ];
 
-    // Style header row
-    const headerRow = ws.getRow(1);
-    headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-    headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF111827' } };
-    headerRow.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
-    headerRow.height = 30;
-
-    // ── Helper: row background by type ──────────────────────────────
-    const ROW_COLORS = {
-      ORDER:    'FFFFFFFF',
-      SIGNUP:   'FFE0F2FE',
-      AUDIT:    'FFFFF3CD',
-      PAYMENT:  'FFD4EDDA',
-      NOTIF:    'FFF3E8FF',
-    };
-
-    function styleRow(row, type) {
-      row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ROW_COLORS[type] || 'FFFFFFFF' } };
-      row.alignment = { vertical: 'middle', wrapText: true };
-      row.height = 20;
+    let r = 3;
+    for (const [label, value] of summaryRows) {
+      sum.getCell(`A${r}`).value = label;
+      sum.getCell(`A${r}`).font = { name: 'Calibri', bold: true, size: 11 };
+      sum.getCell(`B${r}`).value = value;
+      sum.getCell(`B${r}`).font = { name: 'Calibri', size: 11 };
+      sum.getCell(`B${r}`).alignment = { horizontal: 'right' };
+      if (label.includes('₹')) sum.getCell(`B${r}`).numFmt = CURRENCY_FMT;
+      sum.getRow(r).eachCell(c => { c.border = CELL_BORDER; });
+      if (r % 2 === 0) sum.getRow(r).eachCell(c => { c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF7F7F8' } }; });
+      r++;
     }
 
-    // ── 1. ORDER rows ────────────────────────────────────────────────
-    for (const o of ordersRes.rows) {
-      const items    = itemsByOrder[o.id] || [];
-      const payment  = paymentByOrder[o.id];
-      const auditStr = (auditByOrder[o.id] || []).join(' | ');
+    r += 1;
+    sum.getCell(`A${r}`).value = 'Row Colour Guide (Orders sheet)';
+    sum.getCell(`A${r}`).font = { bold: true };
+    r++;
+    const legend = [
+      ['Yellow row', 'Order has an assigned crew member'],
+      ['Red row', 'Order is still unassigned'],
+    ];
+    for (const [k, v] of legend) {
+      sum.getCell(`A${r}`).value = k;
+      sum.getCell(`B${r}`).value = v;
+      sum.getCell(`A${r}`).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: k === 'Yellow row' ? ROW_FILLS.ASSIGNED : ROW_FILLS.UNASSIGNED } };
+      r++;
+    }
 
-      const itemNames    = items.map(i => i.name).join(', ');
-      const itemQtys     = items.map(i => `${i.name}: ×${i.qty}`).join(', ');
-      const itemSubtots  = items.map(i => `${i.name}: ₹${i.qty * i.price}`).join(', ');
+    // ══════════════════════════════════════════════════════════════
+    // SHEET 2 — ORDERS (one row per order, payment screenshot embedded)
+    // ══════════════════════════════════════════════════════════════
+    const ordersWs = setupSheet(wb, 'Orders', [
+      { header: 'Order ID',           key: 'orderId',       width: 20 },
+      { header: 'Created At',         key: 'createdAt',     width: 20 },
+      { header: 'Order Type',         key: 'orderType',     width: 12 },
+      { header: 'Customer',           key: 'customer',      width: 20 },
+      { header: 'Customer Email',     key: 'email',         width: 26 },
+      { header: 'Train No',           key: 'trainNo',       width: 10 },
+      { header: 'Train Name',         key: 'trainName',     width: 18 },
+      { header: 'Stall Name',         key: 'stallName',     width: 18 },
+      { header: 'Stall Location',     key: 'stallLoc',      width: 18 },
+      { header: 'Current Location',   key: 'location',      width: 18 },
+      { header: 'ETA',                key: 'eta',           width: 12 },
+      { header: 'Item Count',         key: 'itemCount',     width: 11 },
+      { header: 'Order Total',        key: 'orderTotal',    width: 14 },
+      { header: 'Status',             key: 'status',        width: 13 },
+      { header: 'Assigned Crew',      key: 'crew',          width: 16 },
+      { header: 'Accepted At',        key: 'acceptedAt',    width: 20 },
+      { header: 'Completed At',       key: 'completedAt',   width: 20 },
+      { header: 'Accept Time (min)',  key: 'acceptMins',    width: 14 },
+      { header: 'Delivery Time (min)',key: 'deliverMins',   width: 15 },
+      { header: 'Payment Status',     key: 'paymentStatus', width: 14 },
+      { header: 'Amount Paid',        key: 'amountPaid',    width: 13 },
+      { header: 'Payment Screenshot', key: 'screenshot',    width: 18 },
+      { header: 'Events Summary',     key: 'events',        width: 40 },
+    ]);
+    ordersWs.getColumn('screenshot').alignment = { vertical: 'middle', horizontal: 'center' };
 
-      const row = ws.addRow({
-        rowType:         'ORDER',
-        timestamp:       o.created_at ? new Date(o.created_at).toLocaleString('en-IN') : '',
-        orderId:         o.id,
-        orderType:       o.order_type?.toUpperCase() || 'TRAIN',
-        customerName:    o.user_name,
-        customerEmail:   o.user_email || '',
-        trainNo:         o.order_type === 'train' ? o.train_no : '',
-        trainName:       o.order_type === 'train' ? o.train_name : '',
-        stallName:       o.stall_name || '',
-        stallLocation:   o.stall_location || '',
-        location:        o.current_location || '',
-        eta:             o.eta || '',
-        itemsOrdered:    itemNames,
-        itemQtys:        itemQtys,
-        itemSubtotals:   itemSubtots,
-        orderTotal:      o.total,
-        orderStatus:     o.status,
-        assignedCrew:    o.crew_name || 'Unassigned',
-        events:          auditStr,
-        paymentUploaded: o.payment_uploaded ? 'Yes' : 'No',
-        amountPaid:      payment ? payment.amount_paid : '',
-        paymentFile:     payment ? payment.file_name : '',
-        acceptedAt:      o.accepted_at ? new Date(o.accepted_at).toLocaleString('en-IN') : '',
-        completedAt:     o.completed_at ? new Date(o.completed_at).toLocaleString('en-IN') : '',
-        acceptMins:      o.accept_secs != null ? Math.round(o.accept_secs / 60) : '',
-        deliveryMins:    o.deliver_secs != null ? Math.round(o.deliver_secs / 60) : '',
-        notes:           payment ? `Screenshot: ${payment.file_name || 'uploaded'}` : '',
+    for (const o of orders) {
+      const orderItems = itemsByOrder[o.id] || [];
+      const payment    = paymentByOrder[o.id];
+
+      const row = ordersWs.addRow({
+        orderId:       o.id,
+        createdAt:     o.created_at ? new Date(o.created_at) : null,
+        orderType:     (o.order_type || 'train').toUpperCase(),
+        customer:      o.user_name,
+        email:         o.user_email || '',
+        trainNo:       o.order_type === 'train' ? o.train_no : '',
+        trainName:     o.order_type === 'train' ? o.train_name : '',
+        stallName:     o.stall_name || '',
+        stallLoc:      o.stall_location || '',
+        location:      o.current_location || '',
+        eta:           o.eta || '',
+        itemCount:     orderItems.reduce((s, i) => s + i.qty, 0),
+        orderTotal:    Number(o.total || 0),
+        status:        o.status,
+        crew:          o.crew_name || 'Unassigned',
+        acceptedAt:    o.accepted_at ? new Date(o.accepted_at) : null,
+        completedAt:   o.completed_at ? new Date(o.completed_at) : null,
+        acceptMins:    o.accept_secs != null ? round1(o.accept_secs / 60) : null,
+        deliverMins:   o.deliver_secs != null ? round1(o.deliver_secs / 60) : null,
+        paymentStatus: o.payment_uploaded ? 'Uploaded' : 'Pending',
+        amountPaid:    payment ? Number(payment.amount_paid || 0) : null,
+        screenshot:    payment?.screenshot_base64 ? '' : (payment ? payment.file_name || '' : ''),
+        events:        (auditByOrder[o.id] || []).join('  |  '),
       });
-      styleRow(row, 'ORDER');
 
-      // Embed payment screenshot image if present
+      const fill = o.crew_name ? ROW_FILLS.ASSIGNED : ROW_FILLS.UNASSIGNED;
+      styleBodyRow(row, fill);
+      row.getCell('createdAt').numFmt = DATETIME_FMT;
+      row.getCell('acceptedAt').numFmt = DATETIME_FMT;
+      row.getCell('completedAt').numFmt = DATETIME_FMT;
+      row.getCell('orderTotal').numFmt = CURRENCY_FMT;
+      row.getCell('amountPaid').numFmt = CURRENCY_FMT;
+      row.height = 60;
+
+      // Embed screenshot fitted neatly inside the "Payment Screenshot" cell only
       if (payment?.screenshot_base64) {
         try {
           const b64 = payment.screenshot_base64.startsWith('data:')
             ? payment.screenshot_base64.split(',')[1]
             : payment.screenshot_base64;
-          const imgId = wb.addImage({ base64: b64, extension: 'jpeg' });
-          // Place a small thumbnail beside the row — col 22 (paymentFile), row index
-          const rowIdx = row.number;
-          ws.addImage(imgId, {
-            tl: { col: 21.1, row: rowIdx - 0.9 },
-            br: { col: 22.9, row: rowIdx + 0.1 },
+          const ext = /^data:image\/png/.test(payment.screenshot_base64) ? 'png' : 'jpeg';
+          const imgId = wb.addImage({ base64: b64, extension: ext });
+          const colIdx = ordersWs.getColumn('screenshot').number - 1; // 0-based
+          const rowIdx = row.number - 1; // 0-based
+          ordersWs.addImage(imgId, {
+            tl: { col: colIdx + 0.05, row: rowIdx + 0.05 },
+            ext: { width: 100, height: 75 }, // fixed pixel size so it never overflows the cell
             editAs: 'oneCell',
           });
-          row.height = 50;
-        } catch (_) {
-          // If image embedding fails, just leave the filename text
-        }
+        } catch (_) { /* leave cell blank if image embed fails */ }
       }
     }
 
-    // ── 2. USER SIGNUP rows ──────────────────────────────────────────
-    for (const u of signupsRes.rows) {
-      const row = ws.addRow({
-        rowType:       'SIGNUP',
-        timestamp:     u.created_at ? new Date(u.created_at).toLocaleString('en-IN') : '',
-        customerName:  `${u.first_name} ${u.last_name}`.trim(),
-        customerEmail: u.email,
-        orderType:     u.role,
-        notes:         `New ${u.role} account created`,
+    // ══════════════════════════════════════════════════════════════
+    // SHEET 3 — ORDER ITEMS (line-item detail, one row per product)
+    // ══════════════════════════════════════════════════════════════
+    const itemsWs = setupSheet(wb, 'Order Items', [
+      { header: 'Order ID',     key: 'orderId',   width: 20 },
+      { header: 'Product',      key: 'name',      width: 26 },
+      { header: 'Qty',          key: 'qty',       width: 8  },
+      { header: 'Unit Price',   key: 'price',     width: 13 },
+      { header: 'Subtotal',     key: 'subtotal',  width: 13 },
+    ]);
+    items.forEach((it, idx) => {
+      const row = itemsWs.addRow({
+        orderId:  it.order_id,
+        name:     it.name,
+        qty:      it.qty,
+        price:    Number(it.price),
+        subtotal: Number(it.price) * it.qty,
       });
-      styleRow(row, 'SIGNUP');
-    }
+      styleBodyRow(row, idx % 2 ? 'FFF7F7F8' : null);
+      row.getCell('price').numFmt = CURRENCY_FMT;
+      row.getCell('subtotal').numFmt = CURRENCY_FMT;
+    });
 
-    // ── 3. AUDIT EVENT rows (non-order events / standalone logs) ─────
-    // We already merged order-level audit into order rows above.
-    // Here we add them as standalone rows too so nothing is missed.
-    for (const a of auditRes.rows) {
-      const row = ws.addRow({
-        rowType:   'AUDIT',
-        timestamp: a.event_time ? new Date(a.event_time).toLocaleString('en-IN') : '',
-        orderId:   a.order_id,
-        events:    a.event,
-        assignedCrew: a.performed_by,
-        notes:     a.note || '',
+    // ══════════════════════════════════════════════════════════════
+    // SHEET 4 — AUDIT LOG
+    // ══════════════════════════════════════════════════════════════
+    const auditWs = setupSheet(wb, 'Audit Log', [
+      { header: 'Timestamp',     key: 'time',   width: 20 },
+      { header: 'Order ID',      key: 'orderId',width: 20 },
+      { header: 'Event',         key: 'event',  width: 22 },
+      { header: 'Performed By',  key: 'by',     width: 18 },
+      { header: 'Note',          key: 'note',   width: 40 },
+    ]);
+    audits.forEach((a, idx) => {
+      const row = auditWs.addRow({
+        time:    a.event_time ? new Date(a.event_time) : null,
+        orderId: a.order_id,
+        event:   a.event,
+        by:      a.performed_by,
+        note:    a.note || '',
       });
-      styleRow(row, 'AUDIT');
-    }
+      styleBodyRow(row, idx % 2 ? 'FFF7F7F8' : null);
+      row.getCell('time').numFmt = DATETIME_FMT;
+    });
 
-    // ── 4. PAYMENT rows (standalone payment records) ─────────────────
-    for (const p of paymentsRes.rows) {
-      const row = ws.addRow({
-        rowType:         'PAYMENT',
-        timestamp:       p.uploaded_at ? new Date(p.uploaded_at).toLocaleString('en-IN') : '',
-        orderId:         p.order_id,
-        assignedCrew:    p.uploaded_by,
-        paymentUploaded: 'Yes',
-        amountPaid:      p.amount_paid,
-        paymentFile:     p.file_name || '',
-        notes:           'Payment screenshot uploaded',
+    // ══════════════════════════════════════════════════════════════
+    // SHEET 5 — PAYMENTS
+    // ══════════════════════════════════════════════════════════════
+    const payWs = setupSheet(wb, 'Payments', [
+      { header: 'Order ID',       key: 'orderId',  width: 20 },
+      { header: 'Uploaded At',    key: 'time',     width: 20 },
+      { header: 'Uploaded By',    key: 'by',       width: 16 },
+      { header: 'Amount Paid',    key: 'amount',   width: 14 },
+      { header: 'File Name',      key: 'file',     width: 24 },
+      { header: 'Screenshot',     key: 'shot',     width: 18 },
+    ]);
+    payments.forEach(p => {
+      const row = payWs.addRow({
+        orderId: p.order_id,
+        time:    p.uploaded_at ? new Date(p.uploaded_at) : null,
+        by:      p.uploaded_by,
+        amount:  Number(p.amount_paid || 0),
+        file:    p.file_name || '',
+        shot:    '',
       });
-      styleRow(row, 'PAYMENT');
-    }
+      styleBodyRow(row);
+      row.getCell('time').numFmt = DATETIME_FMT;
+      row.getCell('amount').numFmt = CURRENCY_FMT;
+      row.height = 60;
 
-    // ── 5. NOTIFICATION rows ─────────────────────────────────────────
-    for (const n of notifsRes.rows) {
-      const row = ws.addRow({
-        rowType:       'NOTIFICATION',
-        timestamp:     n.time ? new Date(n.time).toLocaleString('en-IN') : '',
-        customerEmail: n.user_email || '',
-        assignedCrew:  n.crew_id || '',
-        notes:         n.message,
-        events:        n.read ? 'Read' : 'Unread',
+      if (p.screenshot_base64) {
+        try {
+          const b64 = p.screenshot_base64.startsWith('data:') ? p.screenshot_base64.split(',')[1] : p.screenshot_base64;
+          const ext = /^data:image\/png/.test(p.screenshot_base64) ? 'png' : 'jpeg';
+          const imgId = wb.addImage({ base64: b64, extension: ext });
+          const colIdx = payWs.getColumn('shot').number - 1;
+          const rowIdx = row.number - 1;
+          payWs.addImage(imgId, {
+            tl: { col: colIdx + 0.05, row: rowIdx + 0.05 },
+            ext: { width: 100, height: 75 },
+            editAs: 'oneCell',
+          });
+        } catch (_) {}
+      }
+    });
+
+    // ══════════════════════════════════════════════════════════════
+    // SHEET 6 — SIGNUPS
+    // ══════════════════════════════════════════════════════════════
+    const signupWs = setupSheet(wb, 'Signups', [
+      { header: 'Created At', key: 'time',  width: 20 },
+      { header: 'First Name', key: 'first', width: 16 },
+      { header: 'Last Name',  key: 'last',  width: 16 },
+      { header: 'Email',      key: 'email', width: 28 },
+      { header: 'Role',       key: 'role',  width: 12 },
+    ]);
+    signups.forEach((u, idx) => {
+      const row = signupWs.addRow({
+        time:  u.created_at ? new Date(u.created_at) : null,
+        first: u.first_name,
+        last:  u.last_name,
+        email: u.email,
+        role:  u.role,
       });
-      styleRow(row, 'NOTIF');
-    }
+      styleBodyRow(row, idx % 2 ? 'FFF7F7F8' : null);
+      row.getCell('time').numFmt = DATETIME_FMT;
+    });
 
-    // ── Add a colour legend at the bottom ────────────────────────────
-    ws.addRow({});
-    const legendHeader = ws.addRow({ rowType: 'LEGEND', notes: 'Row colour guide:' });
-    legendHeader.font = { bold: true };
-    const legends = [
-      { rowType: 'ORDER (white)',        notes: 'Each order placed, with items, crew, payment info' },
-      { rowType: 'SIGNUP (light blue)',  notes: 'New user account created that day' },
-      { rowType: 'AUDIT (yellow)',       notes: 'Every action taken on an order (placed/accepted/completed)' },
-      { rowType: 'PAYMENT (green)',      notes: 'Payment screenshot uploaded by crew' },
-      { rowType: 'NOTIFICATION (purple)',notes: 'System notifications sent to users/crew' },
-    ];
-    for (const l of legends) {
-      ws.addRow(l);
-    }
-
-    // ── Autofilter on header ─────────────────────────────────────────
-    ws.autoFilter = { from: 'A1', to: 'AA1' };
+    // ══════════════════════════════════════════════════════════════
+    // SHEET 7 — NOTIFICATIONS
+    // ══════════════════════════════════════════════════════════════
+    const notifWs = setupSheet(wb, 'Notifications', [
+      { header: 'Time',         key: 'time',  width: 20 },
+      { header: 'User Email',   key: 'email', width: 26 },
+      { header: 'Crew ID',      key: 'crew',  width: 12 },
+      { header: 'Message',      key: 'msg',   width: 45 },
+      { header: 'Read',         key: 'read',  width: 10 },
+    ]);
+    notifs.forEach((n, idx) => {
+      const row = notifWs.addRow({
+        time:  n.time ? new Date(n.time) : null,
+        email: n.user_email || '',
+        crew:  n.crew_id || '',
+        msg:   n.message,
+        read:  n.read ? 'Yes' : 'No',
+      });
+      styleBodyRow(row, idx % 2 ? 'FFF7F7F8' : null);
+      row.getCell('time').numFmt = DATETIME_FMT;
+    });
 
     // ── Stream response ──────────────────────────────────────────────
-    res.setHeader(
-      'Content-Type',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    );
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename="TrainServe-${date}.xlsx"`
-    );
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="TrainServe-${date}.xlsx"`);
     await wb.xlsx.write(res);
     res.end();
 
@@ -336,5 +420,8 @@ router.get('/daily', ...requireRole('ADMIN'), async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+function avg(arr) { return arr.length ? arr.reduce((s, v) => s + Number(v), 0) / arr.length : 0; }
+function round1(n) { return Math.round(n * 10) / 10; }
 
 module.exports = router;
