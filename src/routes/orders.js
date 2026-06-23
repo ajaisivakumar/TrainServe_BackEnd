@@ -188,19 +188,40 @@ router.get('/deliveries', ...requireRole('CREW'), async (req, res) => {
 
 // ── GET /orders/all ──────────────────────────────────────────────────
 // Admin: all orders
+// ── GET /orders/all ──────────────────────────────────────────────────
+// Admin: all orders. Optional ?date=YYYY-MM-DD restricts to that single day
+// (used by the Dashboard/Analytics pages so their numbers reset daily).
+// Omit ?date to get the full history (used by the "All Orders" admin page).
+
+
 router.get('/all', ...requireRole('ADMIN'), async (req, res) => {
   try {
-    const orders = await fetchOrders();
+    const { date } = req.query;
+    let orders;
+    if (date) {
+      orders = await fetchOrders("WHERE (o.created_at AT TIME ZONE 'Asia/Kolkata')::date = $1", [date]);
+    } else {
+      orders = await fetchOrders();
+    }
     res.json(orders);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+
+
+
+
 // ── GET /orders/stats ────────────────────────────────────────────────
 // Admin dashboard stats
+// ── GET /orders/stats ────────────────────────────────────────────────
+// Admin dashboard stats. Defaults to "today" (server date) so the
+// dashboard naturally resets every 24h without deleting any order data.
+// Pass ?date=YYYY-MM-DD to view stats for a specific past day instead.
 router.get('/stats', ...requireRole('ADMIN'), async (req, res) => {
   try {
+    const date = req.query.date || new Date().toISOString().slice(0, 10);
     const { rows } = await pool.query(`
       SELECT
         COUNT(*)                                           AS "totalOrders",
@@ -209,7 +230,8 @@ router.get('/stats', ...requireRole('ADMIN'), async (req, res) => {
         COUNT(*) FILTER (WHERE status = 'COMPLETED')      AS completed,
         COALESCE(SUM(total) FILTER (WHERE status = 'COMPLETED'), 0) AS revenue
       FROM orders
-    `);
+      WHERE (created_at AT TIME ZONE 'Asia/Kolkata')::date = $1
+    `, [date]);
     const s = rows[0];
     res.json({
       totalOrders: parseInt(s.totalOrders),
@@ -217,6 +239,7 @@ router.get('/stats', ...requireRole('ADMIN'), async (req, res) => {
       accepted:    parseInt(s.accepted),
       completed:   parseInt(s.completed),
       revenue:     parseInt(s.revenue),
+      date,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
