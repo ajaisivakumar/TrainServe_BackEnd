@@ -12,6 +12,7 @@ const userRoutes    = require('./routes/users');
 const orderRoutes   = require('./routes/orders');
 const notifRoutes   = require('./routes/notifications');
 const reportRoutes   = require('./routes/reports');
+const productRoutes  = require('./routes/products');
 
 const app  = express();
 const PORT = process.env.PORT || 8080;
@@ -49,6 +50,7 @@ app.use('/api/users',         userRoutes);
 app.use('/api/orders',        orderRoutes);
 app.use('/api/notifications', notifRoutes);
 app.use('/api/reports', reportRoutes);
+app.use('/api/products',      productRoutes);
 
 // ── 404 fallback ───────────────────────────────────
 
