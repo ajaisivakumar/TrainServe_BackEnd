@@ -8,7 +8,7 @@ const cors          = require('cors');
 const helmet        = require('helmet');
 const rateLimit     = require('express-rate-limit');
 const initDb        = require('./db/init');
-
+const productRoutes = require('./routes/products');
 const authRoutes    = require('./routes/auth');
 const userRoutes    = require('./routes/users');
 const orderRoutes   = require('./routes/orders');
@@ -71,6 +71,7 @@ app.use('/api/users',         userRoutes);
 app.use('/api/orders',        orderRoutes);
 app.use('/api/notifications', notifRoutes);
 app.use('/api/reports',       reportRoutes);
+app.use('/api/products', productRoutes);
 
 // ── 404 fallback ──────────────────────────────────────────────────────
 app.use((req, res) => {
