@@ -9,7 +9,6 @@ const pool   = require('../db/pool');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
 // ── GET /users/crew ──────────────────────────────────────────────────
-// Used by admin pages to list crew with online status
 router.get('/crew', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -22,19 +21,25 @@ router.get('/crew', requireAuth, async (req, res) => {
     );
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[GET /users/crew]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
-
-
-
 // ── POST /users/crew ─────────────────────────────────────────────────
-// Admin only: add a new crew member. Auto-generates the next CREW00N id.
+// Admin only: add a new crew member
 router.post('/crew', ...requireRole('ADMIN'), async (req, res) => {
   const { name, pin } = req.body;
-  if (!name || !pin) return res.status(400).json({ error: 'name and pin are required' });
-  if (!/^\d{4}$/.test(String(pin))) return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+
+  if (!name || !pin) {
+    return res.status(400).json({ error: 'name and pin are required' });
+  }
+  if (name.length > 80) {
+    return res.status(400).json({ error: 'Name is too long (max 80 characters)' });
+  }
+  if (!/^\d{4}$/.test(String(pin))) {
+    return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+  }
 
   try {
     const { rows: existing } = await pool.query(
@@ -51,51 +56,72 @@ router.post('/crew', ...requireRole('ADMIN'), async (req, res) => {
     await pool.query(
       `INSERT INTO crew (crew_id, name, pin_hash, online)
        VALUES ($1, $2, $3, FALSE)`,
-      [crewId, name, pinHash]
+      [crewId, name.trim(), pinHash]
     );
 
-    res.status(201).json({ crewId, name });
+    res.status(201).json({ crewId, name: name.trim() });
   } catch (err) {
     if (err.code === '23505') {
       return res.status(409).json({ error: 'Crew ID already exists, try again' });
     }
-    res.status(500).json({ error: err.message });
+    console.error('[POST /users/crew]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
 // ── PATCH /users/crew/:crewId ────────────────────────────────────────
-// Admin only: update a crew member's name and/or PIN.
+// Admin only: update a crew member's name and/or PIN
 router.patch('/crew/:crewId', ...requireRole('ADMIN'), async (req, res) => {
   const { crewId } = req.params;
   const { name, pin } = req.body;
 
-  if (!name && !pin) return res.status(400).json({ error: 'Provide a name or pin to update' });
-  if (pin && !/^\d{4}$/.test(String(pin))) return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+  if (!name && !pin) {
+    return res.status(400).json({ error: 'Provide a name or pin to update' });
+  }
+  if (name && name.length > 80) {
+    return res.status(400).json({ error: 'Name is too long (max 80 characters)' });
+  }
+  if (pin && !/^\d{4}$/.test(String(pin))) {
+    return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+  }
 
   try {
-    const { rows: found } = await pool.query('SELECT crew_id FROM crew WHERE crew_id = $1', [crewId]);
-    if (!found.length) return res.status(404).json({ error: 'Crew member not found' });
+    const { rows: found } = await pool.query(
+      'SELECT crew_id FROM crew WHERE crew_id = $1',
+      [crewId]
+    );
+    if (!found.length) {
+      return res.status(404).json({ error: 'Crew member not found' });
+    }
 
     if (name && pin) {
       const pinHash = await bcrypt.hash(String(pin), 10);
-      await pool.query('UPDATE crew SET name = $1, pin_hash = $2 WHERE crew_id = $3', [name, pinHash, crewId]);
+      await pool.query(
+        'UPDATE crew SET name = $1, pin_hash = $2 WHERE crew_id = $3',
+        [name.trim(), pinHash, crewId]
+      );
     } else if (name) {
-      await pool.query('UPDATE crew SET name = $1 WHERE crew_id = $2', [name, crewId]);
+      await pool.query(
+        'UPDATE crew SET name = $1 WHERE crew_id = $2',
+        [name.trim(), crewId]
+      );
     } else if (pin) {
       const pinHash = await bcrypt.hash(String(pin), 10);
-      await pool.query('UPDATE crew SET pin_hash = $1 WHERE crew_id = $2', [pinHash, crewId]);
+      await pool.query(
+        'UPDATE crew SET pin_hash = $1 WHERE crew_id = $2',
+        [pinHash, crewId]
+      );
     }
 
     res.json({ message: 'Crew member updated' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[PATCH /users/crew/:crewId]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
 // ── DELETE /users/crew/:crewId ───────────────────────────────────────
-// Admin only: remove a crew member.
-// Blocked if they still have non-completed orders assigned, to avoid
-// orphaning an active delivery.
+// Admin only: remove a crew member
 router.delete('/crew/:crewId', ...requireRole('ADMIN'), async (req, res) => {
   const { crewId } = req.params;
   try {
@@ -109,12 +135,18 @@ router.delete('/crew/:crewId', ...requireRole('ADMIN'), async (req, res) => {
       });
     }
 
-    const { rowCount } = await pool.query('DELETE FROM crew WHERE crew_id = $1', [crewId]);
-    if (!rowCount) return res.status(404).json({ error: 'Crew member not found' });
+    const { rowCount } = await pool.query(
+      'DELETE FROM crew WHERE crew_id = $1',
+      [crewId]
+    );
+    if (!rowCount) {
+      return res.status(404).json({ error: 'Crew member not found' });
+    }
 
     res.json({ message: 'Crew member deleted' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[DELETE /users/crew/:crewId]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -129,16 +161,18 @@ router.get('/all', ...requireRole('ADMIN'), async (req, res) => {
               role,
               created_at AS "createdAt"
        FROM users
-       ORDER BY created_at DESC`
+       ORDER BY created_at DESC
+       LIMIT 500`
     );
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[GET /users/all]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
 // ── POST /users/logout ───────────────────────────────────────────────
-// Marks crew as offline; for regular users it's just a client-side clear
+// Marks crew as offline
 router.post('/logout', requireAuth, async (req, res) => {
   try {
     if (req.user.role === 'CREW') {
@@ -149,7 +183,8 @@ router.post('/logout', requireAuth, async (req, res) => {
     }
     res.status(204).end();
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[POST /users/logout]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
