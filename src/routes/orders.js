@@ -5,11 +5,15 @@ const router = require('express').Router();
 const pool   = require('../db/pool');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
-// ── Helper: generate a human-readable order ID ───────────────────────
-async function generateOrderId() {
-  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-  const { rows } = await pool.query(
-    `SELECT COUNT(*) AS cnt FROM orders WHERE id LIKE $1`,
+function todayIST() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+}
+
+// ── Fixed: pass client in so it runs inside the transaction (no race condition) ──
+async function generateOrderId(client) {
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }).replace(/-/g, '');
+  const { rows } = await client.query(
+    `SELECT COUNT(*) AS cnt FROM orders WHERE id LIKE $1 FOR UPDATE`,
     [`ORD-${today}-%`]
   );
   const seq = String(parseInt(rows[0].cnt) + 1).padStart(4, '0');
@@ -45,7 +49,6 @@ async function fetchOrders(whereClause = '', params = []) {
     params
   );
 
-  // Attach items to each order
   if (!rows.length) return [];
   const ids = rows.map(r => r.id);
   const { rows: items } = await pool.query(
@@ -62,7 +65,6 @@ async function fetchOrders(whereClause = '', params = []) {
 }
 
 // ── POST /orders ─────────────────────────────────────────────────────
-// Place a new order (user, pantry, or admin)
 router.post('/', requireAuth, async (req, res) => {
   const {
     orderType = 'train',
@@ -70,6 +72,14 @@ router.post('/', requireAuth, async (req, res) => {
     stallName, stallLocation,
     items
   } = req.body;
+
+  // Input length guards
+  if (userName && userName.length > 100)
+    return res.status(400).json({ error: 'Name is too long (max 100 characters)' });
+  if (trainName && trainName.length > 150)
+    return res.status(400).json({ error: 'Train name is too long (max 150 characters)' });
+  if (!items || !Array.isArray(items) || items.length > 50)
+    return res.status(400).json({ error: 'Invalid items list' });
 
   if (orderType === 'train') {
     if (!userName || !trainNo || !trainName || !currentLocation || !eta || !items?.length) {
@@ -83,16 +93,15 @@ router.post('/', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Invalid orderType' });
   }
 
-
-
-
-  
-  const total = items.reduce((s, i) => s + i.price * i.qty, 0);
-  const orderId = await generateOrderId();
-  const client  = await pool.connect();
+  const total  = items.reduce((s, i) => s + i.price * i.qty, 0);
+  const userId = req.user.role === 'CREW' ? null : (req.user.id || null);
+  const client = await pool.connect();
 
   try {
     await client.query('BEGIN');
+
+    // Generate ID inside transaction to prevent race condition
+    const orderId = await generateOrderId(client);
 
     await client.query(
       `INSERT INTO orders
@@ -100,7 +109,7 @@ router.post('/', requireAuth, async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
       [
         orderId,
-        req.user.id || null,
+        userId,
         userName,
         orderType === 'train' ? trainNo : '',
         orderType === 'train' ? trainName : stallName,
@@ -144,36 +153,36 @@ router.post('/', requireAuth, async (req, res) => {
     res.status(201).json({ id: orderId, total });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    console.error('[POST /orders]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   } finally {
     client.release();
   }
 });
 
 // ── GET /orders/my ───────────────────────────────────────────────────
-// User's own orders
 router.get('/my', requireAuth, async (req, res) => {
   try {
     const orders = await fetchOrders('WHERE o.user_id = $1', [req.user.id]);
     res.json(orders);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[GET /orders/my]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
 // ── GET /orders/pending ──────────────────────────────────────────────
-// All pending orders for crew to see and accept
 router.get('/pending', ...requireRole('CREW', 'ADMIN'), async (req, res) => {
   try {
     const orders = await fetchOrders(`WHERE o.status = 'PENDING'`);
     res.json(orders);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[GET /orders/pending]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
 // ── GET /orders/deliveries ───────────────────────────────────────────
-// Orders assigned to the logged-in crew member
 router.get('/deliveries', ...requireRole('CREW'), async (req, res) => {
   try {
     const orders = await fetchOrders(
@@ -182,18 +191,12 @@ router.get('/deliveries', ...requireRole('CREW'), async (req, res) => {
     );
     res.json(orders);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[GET /orders/deliveries]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
 // ── GET /orders/all ──────────────────────────────────────────────────
-// Admin: all orders
-// ── GET /orders/all ──────────────────────────────────────────────────
-// Admin: all orders. Optional ?date=YYYY-MM-DD restricts to that single day
-// (used by the Dashboard/Analytics pages so their numbers reset daily).
-// Omit ?date to get the full history (used by the "All Orders" admin page).
-
-
 router.get('/all', ...requireRole('ADMIN'), async (req, res) => {
   try {
     const { date } = req.query;
@@ -205,23 +208,15 @@ router.get('/all', ...requireRole('ADMIN'), async (req, res) => {
     }
     res.json(orders);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[GET /orders/all]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
-
-
-
-
 // ── GET /orders/stats ────────────────────────────────────────────────
-// Admin dashboard stats
-// ── GET /orders/stats ────────────────────────────────────────────────
-// Admin dashboard stats. Defaults to "today" (server date) so the
-// dashboard naturally resets every 24h without deleting any order data.
-// Pass ?date=YYYY-MM-DD to view stats for a specific past day instead.
 router.get('/stats', ...requireRole('ADMIN'), async (req, res) => {
   try {
-    const date = req.query.date || new Date().toISOString().slice(0, 10);
+    const date = req.query.date || todayIST();
     const { rows } = await pool.query(`
       SELECT
         COUNT(*)                                           AS "totalOrders",
@@ -242,12 +237,12 @@ router.get('/stats', ...requireRole('ADMIN'), async (req, res) => {
       date,
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[GET /orders/stats]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
 // ── PATCH /orders/:id/accept ─────────────────────────────────────────
-// Crew accepts an order
 router.patch('/:id/accept', ...requireRole('CREW'), async (req, res) => {
   const { id } = req.params;
   const client  = await pool.connect();
@@ -272,7 +267,6 @@ router.patch('/:id/accept', ...requireRole('CREW'), async (req, res) => {
       [id, req.user.name]
     );
 
-    // Notify the customer
     const o = rows[0];
     if (o.user_id) {
       await client.query(
@@ -286,14 +280,14 @@ router.patch('/:id/accept', ...requireRole('CREW'), async (req, res) => {
     res.json({ message: 'Order accepted' });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    console.error('[PATCH /orders/:id/accept]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   } finally {
     client.release();
   }
 });
 
 // ── PATCH /orders/:id/assign ─────────────────────────────────────────
-// Admin manually assigns a crew member
 router.patch('/:id/assign', ...requireRole('ADMIN'), async (req, res) => {
   const { id }     = req.params;
   const { crewId } = req.body;
@@ -305,7 +299,7 @@ router.patch('/:id/assign', ...requireRole('ADMIN'), async (req, res) => {
 
     const { rows } = await client.query(
       `UPDATE orders
-       SET assigned_crew_id = $1
+       SET assigned_crew_id = $1, status = 'ACCEPTED', accepted_at = COALESCE(accepted_at, NOW())
        WHERE id = $2
        RETURNING *`,
       [crewId, id]
@@ -321,7 +315,6 @@ router.patch('/:id/assign', ...requireRole('ADMIN'), async (req, res) => {
       [id, req.user.name, `Crew ${crewId} assigned by admin`]
     );
 
-    // Notify the crew
     await client.query(
       `INSERT INTO notifications (crew_id, message)
        VALUES ($1, $2)`,
@@ -332,14 +325,14 @@ router.patch('/:id/assign', ...requireRole('ADMIN'), async (req, res) => {
     res.json({ message: 'Crew assigned' });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    console.error('[PATCH /orders/:id/assign]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   } finally {
     client.release();
   }
 });
 
-// ── PATCH /orders/:id/payment-screenshot ────────────────────────────
-// Crew uploads payment proof
+// ── PATCH /orders/:id/payment-screenshot ─────────────────────────────
 router.patch('/:id/payment-screenshot', ...requireRole('CREW', 'ADMIN'), async (req, res) => {
   const { id } = req.params;
   const { screenshotBase64, fileName, amountPaid = 0 } = req.body;
@@ -365,14 +358,14 @@ router.patch('/:id/payment-screenshot', ...requireRole('CREW', 'ADMIN'), async (
     res.json({ message: 'Screenshot saved' });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    console.error('[PATCH /orders/:id/payment-screenshot]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   } finally {
     client.release();
   }
 });
 
 // ── PATCH /orders/:id/complete ───────────────────────────────────────
-// Crew marks order delivered
 router.patch('/:id/complete', ...requireRole('CREW', 'ADMIN'), async (req, res) => {
   const { id } = req.params;
   const client  = await pool.connect();
@@ -397,13 +390,12 @@ router.patch('/:id/complete', ...requireRole('CREW', 'ADMIN'), async (req, res) 
       [id, req.user.name]
     );
 
-    // Notify the customer
     const o = rows[0];
     if (o.user_id) {
       await client.query(
         `INSERT INTO notifications (user_id, message)
          VALUES ($1, $2)`,
-        [o.user_id, `Your order ${id} has been delivered! Thank you for ordering with TrainServe.`]
+        [o.user_id, `Your order ${id} has been delivered! Thank you for ordering with KB ENTERPRISES.`]
       );
     }
 
@@ -411,15 +403,14 @@ router.patch('/:id/complete', ...requireRole('CREW', 'ADMIN'), async (req, res) 
     res.json({ message: 'Order completed' });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    console.error('[PATCH /orders/:id/complete]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   } finally {
     client.release();
   }
 });
 
-// ── Admin audit endpoints ────────────────────────────────────────────
-
-// GET /orders/admin/logs
+// ── GET /orders/admin/logs ───────────────────────────────────────────
 router.get('/admin/logs', ...requireRole('ADMIN'), async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -432,11 +423,12 @@ router.get('/admin/logs', ...requireRole('ADMIN'), async (req, res) => {
     );
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[GET /orders/admin/logs]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
-// GET /orders/admin/delivery-logs
+// ── GET /orders/admin/delivery-logs ─────────────────────────────────
 router.get('/admin/delivery-logs', ...requireRole('ADMIN'), async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -457,11 +449,12 @@ router.get('/admin/delivery-logs', ...requireRole('ADMIN'), async (req, res) => 
     );
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[GET /orders/admin/delivery-logs]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
-// GET /orders/admin/payments
+// ── GET /orders/admin/payments ───────────────────────────────────────
 router.get('/admin/payments', ...requireRole('ADMIN'), async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -478,7 +471,8 @@ router.get('/admin/payments', ...requireRole('ADMIN'), async (req, res) => {
     );
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[GET /orders/admin/payments]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
